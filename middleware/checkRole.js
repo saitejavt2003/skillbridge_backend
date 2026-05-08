@@ -1,4 +1,4 @@
-const pool = require("../db");
+const pool = require("../db/pool");
 
 const checkRole = (allowedRoles) => {
   return async (req, res, next) => {

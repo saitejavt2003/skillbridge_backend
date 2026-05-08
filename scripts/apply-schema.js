@@ -2,7 +2,7 @@ require("dotenv").config();
 
 const fs = require("fs/promises");
 const path = require("path");
-const pool = require("../db");
+const pool = require("../db/pool");
 
 async function applySchema() {
   const schemaPath = path.join(__dirname, "..", "db", "schema.sql");

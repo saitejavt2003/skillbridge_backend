@@ -3,7 +3,7 @@ const cors = require("cors");
 
 require("dotenv").config();
 
-const pool = require("./db");
+const pool = require("./db/pool");
 const checkRole = require("./middleware/checkRole");
 
 const app = express();
