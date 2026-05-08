@@ -6,7 +6,7 @@
     "dev": "nodemon server.js",
     "start": "node server.js",
     "db:check": "node scripts/check-db.js",
-    "db:schema": "..\\tools\\pgsql\\bin\\psql.exe -f db/schema.sql"
+    "db:schema": "node scripts/apply-schema.js"
   },
   "keywords": [],
   "author": "",

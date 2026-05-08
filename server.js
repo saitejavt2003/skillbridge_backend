@@ -97,10 +97,10 @@ app.get(
 
 app.post(
   "/batches",
-  checkRole(["trainer"]),
+  checkRole(["trainer", "institution"]),
   asyncHandler(async (req, res) => {
-    const { name } = req.body;
-    const trainerId = req.user.id;
+    const { name, trainer_id } = req.body;
+    const ownerId = req.user.id;
 
     if (!name || !name.trim()) {
       return res.status(400).json({ message: "Batch name is required" });
@@ -112,15 +112,36 @@ app.post(
       await client.query("BEGIN");
 
       const batchResult = await client.query(
-        "INSERT INTO batches (name) VALUES ($1) RETURNING *",
-        [name.trim()]
+        "INSERT INTO batches (name, institution_id) VALUES ($1,$2) RETURNING *",
+        [name.trim(), req.user.role === "institution" ? ownerId : null]
       );
       const batch = batchResult.rows[0];
 
-      await client.query(
-        "INSERT INTO batch_trainers (batch_id, trainer_id) VALUES ($1,$2) ON CONFLICT (batch_id, trainer_id) DO NOTHING",
-        [batch.id, trainerId]
-      );
+      if (req.user.role === "trainer") {
+        await client.query(
+          "INSERT INTO batch_trainers (batch_id, trainer_id) VALUES ($1,$2) ON CONFLICT (batch_id, trainer_id) DO NOTHING",
+          [batch.id, ownerId]
+        );
+      }
+
+      if (req.user.role === "institution" && trainer_id) {
+        const trainer = await client.query(
+          "SELECT id FROM users WHERE id = $1 AND role = 'trainer' AND institution_id = $2",
+          [trainer_id, ownerId]
+        );
+
+        if (!trainer.rows[0]) {
+          await client.query("ROLLBACK");
+          return res
+            .status(400)
+            .json({ message: "Trainer is not linked to this institution" });
+        }
+
+        await client.query(
+          "INSERT INTO batch_trainers (batch_id, trainer_id) VALUES ($1,$2) ON CONFLICT (batch_id, trainer_id) DO NOTHING",
+          [batch.id, trainer_id]
+        );
+      }
 
       await client.query("COMMIT");
       res.status(201).json(batch);
@@ -130,6 +151,178 @@ app.post(
     } finally {
       client.release();
     }
+  })
+);
+
+app.get(
+  "/batches/institution",
+  checkRole(["institution"]),
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `WITH batch_stats AS (
+         SELECT batches.id,
+                COUNT(DISTINCT batch_students.student_id)::int AS student_count,
+                COUNT(DISTINCT sessions.id)::int AS session_count,
+                COUNT(DISTINCT attendance.id)::int AS attended_count
+         FROM batches
+         LEFT JOIN batch_students ON batch_students.batch_id = batches.id
+         LEFT JOIN sessions ON sessions.batch_id = batches.id
+         LEFT JOIN attendance ON attendance.session_id = sessions.id
+          AND attendance.student_id = batch_students.student_id
+         WHERE batches.institution_id = $1
+         GROUP BY batches.id
+       )
+       SELECT batches.*,
+              batch_stats.student_count,
+              batch_stats.session_count,
+              CASE
+                WHEN batch_stats.student_count * batch_stats.session_count = 0 THEN 0
+                ELSE ROUND(
+                  batch_stats.attended_count::numeric /
+                  (batch_stats.student_count * batch_stats.session_count) * 100,
+                  2
+                )
+              END AS attendance_percentage
+       FROM batches
+       INNER JOIN batch_stats ON batch_stats.id = batches.id
+       ORDER BY batches.id DESC`,
+      [req.user.id]
+    );
+
+    res.json(result.rows);
+  })
+);
+
+app.get(
+  "/institution/trainers",
+  checkRole(["institution"]),
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `SELECT users.id,
+              users.clerk_user_id,
+              users.name,
+              COUNT(DISTINCT batch_trainers.batch_id)::int AS batch_count
+       FROM users
+       LEFT JOIN batch_trainers ON batch_trainers.trainer_id = users.id
+       LEFT JOIN batches ON batches.id = batch_trainers.batch_id
+       WHERE users.role = 'trainer'
+         AND users.institution_id = $1
+       GROUP BY users.id
+       ORDER BY users.id DESC`,
+      [req.user.id]
+    );
+
+    res.json(result.rows);
+  })
+);
+
+app.post(
+  "/trainers/assign",
+  checkRole(["institution"]),
+  asyncHandler(async (req, res) => {
+    const { clerk_user_id, name, batch_id } = req.body;
+
+    if (!clerk_user_id || !name) {
+      return res
+        .status(400)
+        .json({ message: "Trainer clerk_user_id and name are required" });
+    }
+
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const trainerResult = await client.query(
+        `INSERT INTO users (clerk_user_id, name, role, institution_id)
+         VALUES ($1,$2,'trainer',$3)
+         ON CONFLICT (clerk_user_id)
+         DO UPDATE SET name = EXCLUDED.name,
+                       role = 'trainer',
+                       institution_id = EXCLUDED.institution_id
+         RETURNING *`,
+        [clerk_user_id, name, req.user.id]
+      );
+      const trainer = trainerResult.rows[0];
+
+      if (batch_id) {
+        const batch = await client.query(
+          "SELECT id FROM batches WHERE id = $1 AND institution_id = $2",
+          [batch_id, req.user.id]
+        );
+
+        if (!batch.rows[0]) {
+          await client.query("ROLLBACK");
+          return res
+            .status(400)
+            .json({ message: "Batch does not belong to this institution" });
+        }
+
+        await client.query(
+          "INSERT INTO batch_trainers (batch_id, trainer_id) VALUES ($1,$2) ON CONFLICT (batch_id, trainer_id) DO NOTHING",
+          [batch_id, trainer.id]
+        );
+      }
+
+      await client.query("COMMIT");
+      res.status(201).json(trainer);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  })
+);
+
+app.get(
+  "/batches/:id/summary",
+  checkRole(["institution", "trainer"]),
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const params = [id];
+    let accessClause = "";
+
+    if (req.user.role === "institution") {
+      params.push(req.user.id);
+      accessClause = "AND batches.institution_id = $2";
+    }
+
+    if (req.user.role === "trainer") {
+      params.push(req.user.id);
+      accessClause =
+        "AND EXISTS (SELECT 1 FROM batch_trainers WHERE batch_trainers.batch_id = batches.id AND batch_trainers.trainer_id = $2)";
+    }
+
+    const result = await pool.query(
+      `SELECT batches.id,
+              batches.name,
+              COUNT(DISTINCT batch_students.student_id)::int AS student_count,
+              COUNT(DISTINCT sessions.id)::int AS session_count,
+              COUNT(DISTINCT attendance.id)::int AS attended_count,
+              CASE
+                WHEN COUNT(DISTINCT batch_students.student_id) * COUNT(DISTINCT sessions.id) = 0 THEN 0
+                ELSE ROUND(
+                  COUNT(DISTINCT attendance.id)::numeric /
+                  (COUNT(DISTINCT batch_students.student_id) * COUNT(DISTINCT sessions.id)) * 100,
+                  2
+                )
+              END AS attendance_percentage
+       FROM batches
+       LEFT JOIN batch_students ON batch_students.batch_id = batches.id
+       LEFT JOIN sessions ON sessions.batch_id = batches.id
+       LEFT JOIN attendance ON attendance.session_id = sessions.id
+        AND attendance.student_id = batch_students.student_id
+       WHERE batches.id = $1 ${accessClause}
+       GROUP BY batches.id`,
+      params
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ message: "Batch summary not found" });
+    }
+
+    res.json(result.rows[0]);
   })
 );
 
@@ -320,6 +513,92 @@ app.get(
        WHERE attendance.session_id = $1
        ORDER BY attendance.id DESC`,
       [sessionId]
+    );
+
+    res.json(result.rows);
+  })
+);
+
+app.get(
+  "/programme/summary",
+  checkRole(["monitoring_officer"]),
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `WITH possible AS (
+         SELECT COALESCE(SUM(batch_counts.student_count * batch_counts.session_count), 0)::int AS total_possible
+         FROM (
+           SELECT batches.id,
+                  COUNT(DISTINCT batch_students.student_id) AS student_count,
+                  COUNT(DISTINCT sessions.id) AS session_count
+           FROM batches
+           LEFT JOIN batch_students ON batch_students.batch_id = batches.id
+           LEFT JOIN sessions ON sessions.batch_id = batches.id
+           GROUP BY batches.id
+         ) batch_counts
+       ),
+       attended AS (
+         SELECT COUNT(DISTINCT attendance.id)::int AS total_attended
+         FROM attendance
+         INNER JOIN sessions ON sessions.id = attendance.session_id
+         INNER JOIN batch_students ON batch_students.batch_id = sessions.batch_id
+          AND batch_students.student_id = attendance.student_id
+       )
+       SELECT
+         (SELECT COUNT(*)::int FROM users WHERE role = 'institution') AS total_institutions,
+         (SELECT COUNT(*)::int FROM batches) AS total_batches,
+         (SELECT COUNT(*)::int FROM sessions) AS total_sessions,
+         (SELECT COUNT(*)::int FROM users WHERE role = 'student') AS total_students,
+         CASE
+           WHEN possible.total_possible = 0 THEN 0
+           ELSE ROUND(attended.total_attended::numeric / possible.total_possible * 100, 2)
+         END AS overall_attendance_percentage
+       FROM possible, attended`
+    );
+
+    res.json(result.rows[0]);
+  })
+);
+
+app.get(
+  "/institutions/summary",
+  checkRole(["monitoring_officer"]),
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `WITH institution_stats AS (
+         SELECT institutions.id,
+                institutions.name,
+                COUNT(DISTINCT batches.id)::int AS batch_count,
+                COUNT(DISTINCT trainers.id)::int AS trainer_count,
+                COUNT(DISTINCT batch_students.student_id)::int AS student_count,
+                COUNT(DISTINCT sessions.id)::int AS session_count,
+                COUNT(DISTINCT attendance.id)::int AS attended_count,
+                (
+                  COUNT(DISTINCT batch_students.student_id) *
+                  COUNT(DISTINCT sessions.id)
+                )::int AS possible_count
+         FROM users institutions
+         LEFT JOIN batches ON batches.institution_id = institutions.id
+         LEFT JOIN users trainers ON trainers.institution_id = institutions.id
+           AND trainers.role = 'trainer'
+         LEFT JOIN batch_students ON batch_students.batch_id = batches.id
+         LEFT JOIN sessions ON sessions.batch_id = batches.id
+         LEFT JOIN attendance ON attendance.session_id = sessions.id
+          AND attendance.student_id = batch_students.student_id
+         WHERE institutions.role = 'institution'
+         GROUP BY institutions.id
+       )
+       SELECT id,
+              name,
+              batch_count,
+              trainer_count,
+              student_count,
+              session_count,
+              CASE
+                WHEN possible_count = 0 THEN 0
+                ELSE ROUND(attended_count::numeric / possible_count * 100, 2)
+              END AS attendance_percentage
+       FROM institution_stats
+       ORDER BY name`
     );
 
     res.json(result.rows);

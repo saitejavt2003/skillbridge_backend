@@ -1,29 +1,17 @@
 const { Pool } = require("pg");
 
-const requiredEnvVars = [
-  "DB_HOST",
-  "DB_PORT",
-  "DB_NAME",
-  "DB_USER",
-  "DB_PASSWORD",
-];
+const { DATABASE_URL } = process.env;
 
-const missingEnvVars = requiredEnvVars.filter((key) => !process.env[key]);
-
-if (missingEnvVars.length > 0) {
+if (!DATABASE_URL) {
   throw new Error(
-    `Missing required database environment variables: ${missingEnvVars.join(", ")}`
+    "Missing required DATABASE_URL environment variable. Set it to your PostgreSQL connection string."
   );
 }
 
 const useSsl = process.env.DB_SSL !== "false";
 
 const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: Number(process.env.DB_PORT),
-  database: process.env.DB_NAME,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
+  connectionString: DATABASE_URL,
   ssl: useSsl ? { rejectUnauthorized: false } : false,
   max: Number(process.env.DB_POOL_MAX || 10),
   idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS || 30000),
